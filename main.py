@@ -616,10 +616,11 @@ class MainWindow(QMainWindow):
 
         # 继电器自动循环相关
         self._cycle_timer = QTimer(self)
-        self._cycle_timer.setSingleShot(True)
+        self._cycle_timer.setInterval(200)
         self._cycle_timer.timeout.connect(self._on_cycle_timeout)
         self._auto_cycle_enabled = False
         self._cycle_state = "wait_open"
+        self._cycle_next_timestamp: Optional[float] = None
         self._countdown_timer = QTimer(self)
         self._countdown_timer.setInterval(1000)
         self._countdown_timer.timeout.connect(self._on_countdown_tick)
@@ -630,6 +631,7 @@ class MainWindow(QMainWindow):
         self._timed_output_timer.setInterval(1000)
         self._timed_output_timer.timeout.connect(self._on_timed_output_tick)
         self._timed_output_remaining = 0
+        self._timed_output_end_timestamp: Optional[float] = None
         self._timed_output_csv_path: Optional[Path] = None
         self._timed_output_writer: Optional[csv.writer] = None
         self._timed_output_file: Optional[object] = None
@@ -1222,14 +1224,16 @@ class MainWindow(QMainWindow):
             self._countdown_timer.stop()
             return
 
-        if self._countdown_remaining > 0:
-            self._countdown_remaining -= 1
-            try:
-                self.cycle_button.setText(f"停止自动循环 ({self._countdown_remaining}s)")
-            except Exception:
-                pass
-        else:
+        if self._cycle_next_timestamp is None:
             self._countdown_timer.stop()
+            return
+
+        remaining_seconds = self._cycle_next_timestamp - time.monotonic()
+        self._countdown_remaining = max(0, int(round(remaining_seconds)))
+        try:
+            self.cycle_button.setText(f"停止自动循环 ({self._countdown_remaining}s)")
+        except Exception:
+            pass
 
     def _toggle_auto_cycle(self, enable: bool) -> None:
         if enable:
@@ -1247,21 +1251,23 @@ class MainWindow(QMainWindow):
 
         self._auto_cycle_enabled = True
         self._cycle_state = "wait_open"
+        self._cycle_next_timestamp = time.monotonic() + float(self.t1_spin.value())
         self._append_log(f"INFO 继电器自动循环启动：T1={self.t1_spin.value()}s, T2={self.t2_spin.value()}s")
 
         for btn in self.relay_buttons:
             btn.setEnabled(False)
 
-        self._countdown_remaining = int(self.t1_spin.value())
+        self._countdown_remaining = max(0, int(round(self._cycle_next_timestamp - time.monotonic())))
         self.cycle_button.setText(f"停止自动循环 ({self._countdown_remaining}s)")
         self.cycle_button.setChecked(True)
         self._countdown_timer.start()
-        self._cycle_timer.start(int(self._countdown_remaining * 1000))
+        self._cycle_timer.start()
 
     def _stop_auto_cycle(self) -> None:
         if not self._auto_cycle_enabled:
             return
         self._auto_cycle_enabled = False
+        self._cycle_next_timestamp = None
         self._cycle_timer.stop()
         self._countdown_timer.stop()
         self._countdown_remaining = 0
@@ -1276,22 +1282,31 @@ class MainWindow(QMainWindow):
         if not self._auto_cycle_enabled:
             return
 
+        if self._cycle_next_timestamp is None:
+            self._stop_auto_cycle()
+            return
+
+        now = time.monotonic()
+        if now < self._cycle_next_timestamp:
+            return
+
+        scheduled_timestamp = self._cycle_next_timestamp
+
         if self._cycle_state == "wait_open":
             self._append_log("AUTO 打开第 1 路")
             self.set_relay(1, True)
             self._cycle_state = "wait_close"
-            self._countdown_remaining = int(self.t2_spin.value())
-            self._countdown_timer.start()
-            self._cycle_timer.start(self._countdown_remaining * 1000)
-            self.cycle_button.setText(f"停止自动循环 ({self._countdown_remaining}s)")
+            self._cycle_next_timestamp = scheduled_timestamp + float(self.t2_spin.value())
         else:
             self._append_log("AUTO 关闭第 1 路")
             self.set_relay(1, False)
             self._cycle_state = "wait_open"
-            self._countdown_remaining = int(self.t1_spin.value())
+            self._cycle_next_timestamp = scheduled_timestamp + float(self.t1_spin.value())
+
+        self._countdown_remaining = max(0, int(round(self._cycle_next_timestamp - time.monotonic())))
+        self.cycle_button.setText(f"停止自动循环 ({self._countdown_remaining}s)")
+        if not self._countdown_timer.isActive():
             self._countdown_timer.start()
-            self._cycle_timer.start(self._countdown_remaining * 1000)
-            self.cycle_button.setText(f"停止自动循环 ({self._countdown_remaining}s)")
 
     def _toggle_timed_output(self, checked: bool) -> None:
         if checked:
@@ -1308,11 +1323,13 @@ class MainWindow(QMainWindow):
         if self._timed_output_active:
             return
 
+        duration_seconds = float(self.duration_spin.value())
         self._timed_output_active = True
-        self._timed_output_remaining = int(self.duration_spin.value())
+        self._timed_output_end_timestamp = time.monotonic() + duration_seconds
+        self._timed_output_remaining = max(0, int(round(duration_seconds)))
         self._open_timed_output_csv()
         self._append_log(
-            f"INFO 定时通电启动：{self._timed_output_remaining} 秒，电压 {self.voltage_spin.value():.3f} V，电流 {self.current_spin.value():.3f} A"
+            f"INFO 定时通电启动：{duration_seconds:.1f} 秒，电压 {self.voltage_spin.value():.3f} V，电流 {self.current_spin.value():.3f} A"
         )
 
         self._power_serial_thread.set_all_and_start(
@@ -1329,6 +1346,7 @@ class MainWindow(QMainWindow):
             return
 
         self._timed_output_active = False
+        self._timed_output_end_timestamp = None
         self._timed_output_timer.stop()
         self.start_timed_button.setChecked(False)
         self.start_timed_button.setText("开始定时通电")
@@ -1351,8 +1369,14 @@ class MainWindow(QMainWindow):
         if not self._timed_output_active:
             return
 
-        self._timed_output_remaining -= 1
-        if self._timed_output_remaining <= 0:
+        if self._timed_output_end_timestamp is None:
+            self._stop_timed_output()
+            return
+
+        remaining_seconds = self._timed_output_end_timestamp - time.monotonic()
+        self._timed_output_remaining = max(0, int(round(remaining_seconds)))
+
+        if remaining_seconds <= 0:
             self.timed_status_label.setText("剩余时间：0 s")
             self._stop_timed_output()
             return
@@ -1371,6 +1395,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._append_log(f"ERR  无法创建 CSV 文件：{exc}")
             self._timed_output_active = False
+            self._timed_output_end_timestamp = None
             self.start_timed_button.setChecked(False)
             self.start_timed_button.setText("开始定时通电")
             self.timed_status_label.setText("剩余时间：-- s")
