@@ -56,7 +56,7 @@ from power_protocol import (
     parse_output_state,
 )
 
-POLL_INTERVAL_MS = 200
+POLL_INTERVAL_MS = 1000
 SERIAL_TIMEOUT_SECONDS = 0.5
 WRITE_CONFIRM_ATTEMPTS = 3
 POWER_POLL_INTERVAL_MS = 1000
