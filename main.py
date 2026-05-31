@@ -59,6 +59,8 @@ from power_protocol import (
 POLL_INTERVAL_MS = 1000
 SERIAL_TIMEOUT_SECONDS = 0.5
 WRITE_CONFIRM_ATTEMPTS = 3
+POWER_WRITE_CONFIRM_ATTEMPTS = 5
+POWER_CONFIRM_TOLERANCE = 0.02
 POWER_POLL_INTERVAL_MS = 1000
 POWER_SERIAL_TIMEOUT_SECONDS = 0.8
 QUERY_INTERVAL_SECONDS = 0.05
@@ -237,49 +239,130 @@ class PowerSerialThread(QThread):
         self.status_changed.emit(status)
         return status
 
+    def _query_voltage_setting(self) -> float:
+        response = self._query_command("VOLT?")
+        return parse_float_response(response, "电压设定值")
+
+    def _query_current_setting(self) -> float:
+        response = self._query_command("CURR?")
+        return parse_float_response(response, "电流设定值")
+
+    def _query_output_setting(self) -> bool:
+        response = self._query_command(build_query_output_command())
+        return parse_output_state(response)
+
+    def _confirm_voltage_setting(self, expected_voltage: float) -> bool:
+        actual_voltage = self._query_voltage_setting()
+        return abs(actual_voltage - expected_voltage) <= POWER_CONFIRM_TOLERANCE
+
+    def _confirm_current_setting(self, expected_current: float) -> bool:
+        actual_current = self._query_current_setting()
+        return abs(actual_current - expected_current) <= POWER_CONFIRM_TOLERANCE
+
+    def _confirm_output_setting(self, expected_output_on: bool) -> bool:
+        actual_output_on = self._query_output_setting()
+        return actual_output_on is expected_output_on
+
+    def _write_until_confirmed(
+        self,
+        command_text: str,
+        confirm_callback,
+        success_message: str,
+        failure_message: str,
+    ) -> bool:
+        last_error = ""
+        for attempt in range(1, POWER_WRITE_CONFIRM_ATTEMPTS + 1):
+            try:
+                self._write_command(command_text)
+                time.sleep(QUERY_INTERVAL_SECONDS)
+
+                if confirm_callback():
+                    self.log.emit(success_message)
+                    return True
+
+                last_error = "查询到的设置值与目标值不一致"
+
+            except (TimeoutError, serial.SerialException, ValueError, UnicodeError) as exc:
+                last_error = str(exc)
+
+            if attempt < POWER_WRITE_CONFIRM_ATTEMPTS:
+                self.log.emit(
+                    f"INFO {failure_message}，正在重试 "
+                    f"({attempt + 1}/{POWER_WRITE_CONFIRM_ATTEMPTS})"
+                )
+
+        self.error.emit(
+            f"{failure_message}：已重试 {POWER_WRITE_CONFIRM_ATTEMPTS} 次，"
+            f"仍未收到正确确认。{last_error}"
+        )
+        return False
+
     def _set_voltage(self, voltage: float) -> None:
-        try:
-            self._write_command(build_set_voltage_command(voltage))
+        if self._write_until_confirmed(
+            build_set_voltage_command(voltage),
+            lambda: self._confirm_voltage_setting(voltage),
+            f"INFO 电压设置确认成功：{voltage:.3f} V",
+            f"设置电压失败：目标 {voltage:.3f} V 未确认",
+        ):
             self.voltage_set_confirmed.emit(voltage)
             self._read_status(emit_errors=False)
-        except (TimeoutError, serial.SerialException, ValueError, UnicodeError) as exc:
-            self.error.emit(f"设置电压失败：{exc}")
 
     def _set_current(self, current: float) -> None:
-        try:
-            self._write_command(build_set_current_command(current))
+        if self._write_until_confirmed(
+            build_set_current_command(current),
+            lambda: self._confirm_current_setting(current),
+            f"INFO 电流设置确认成功：{current:.3f} A",
+            f"设置电流失败：目标 {current:.3f} A 未确认",
+        ):
             self.current_set_confirmed.emit(current)
             self._read_status(emit_errors=False)
-        except (TimeoutError, serial.SerialException, ValueError, UnicodeError) as exc:
-            self.error.emit(f"设置电流失败：{exc}")
 
     def _set_output(self, output_on: bool) -> None:
-        try:
-            self._write_command(build_output_command(output_on))
-            time.sleep(QUERY_INTERVAL_SECONDS)
+        action = "开启" if output_on else "关闭"
+        if self._write_until_confirmed(
+            build_output_command(output_on),
+            lambda: self._confirm_output_setting(output_on),
+            f"INFO 输出{action}确认成功",
+            f"设置输出状态失败：输出{action}未确认",
+        ):
             self.output_confirmed.emit(output_on)
             self._read_status(emit_errors=False)
-        except (TimeoutError, serial.SerialException, ValueError, UnicodeError) as exc:
-            self.error.emit(f"设置输出状态失败：{exc}")
 
     def _set_all_and_start(self, voltage: float, current: float) -> None:
-        try:
-            self._write_command(build_set_voltage_command(voltage))
-            time.sleep(QUERY_INTERVAL_SECONDS)
-            self.voltage_set_confirmed.emit(voltage)
-
-            self._write_command(build_set_current_command(current))
-            time.sleep(QUERY_INTERVAL_SECONDS)
-            self.current_set_confirmed.emit(current)
-
-            self._write_command(build_output_command(True))
-            time.sleep(QUERY_INTERVAL_SECONDS)
-            self.output_confirmed.emit(True)
-
+        voltage_ok = self._write_until_confirmed(
+            build_set_voltage_command(voltage),
+            lambda: self._confirm_voltage_setting(voltage),
+            f"INFO 电压设置确认成功：{voltage:.3f} V",
+            f"设置并开启电源失败：目标电压 {voltage:.3f} V 未确认",
+        )
+        if not voltage_ok:
             self._read_status(emit_errors=False)
+            return
+        self.voltage_set_confirmed.emit(voltage)
 
-        except (TimeoutError, serial.SerialException, ValueError, UnicodeError) as exc:
-            self.error.emit(f"设置并开启电源失败：{exc}")
+        current_ok = self._write_until_confirmed(
+            build_set_current_command(current),
+            lambda: self._confirm_current_setting(current),
+            f"INFO 电流设置确认成功：{current:.3f} A",
+            f"设置并开启电源失败：目标电流 {current:.3f} A 未确认",
+        )
+        if not current_ok:
+            self._read_status(emit_errors=False)
+            return
+        self.current_set_confirmed.emit(current)
+
+        output_ok = self._write_until_confirmed(
+            build_output_command(True),
+            lambda: self._confirm_output_setting(True),
+            "INFO 输出开启确认成功",
+            "设置并开启电源失败：输出开启未确认",
+        )
+        if not output_ok:
+            self._read_status(emit_errors=False)
+            return
+        self.output_confirmed.emit(True)
+
+        self._read_status(emit_errors=False)
 
 
 class SerialThread(QThread):
